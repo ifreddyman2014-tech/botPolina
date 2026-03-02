@@ -32,37 +32,91 @@ def extract_video_id(url: str) -> Optional[str]:
 # ClearKey DRM helpers
 # ---------------------------------------------------------------------------
 
-async def get_key_ids_from_m3u8(m3u8_url: str, referer: Optional[str] = None) -> list[str]:
-    """Download the HLS manifest and extract ClearKey key IDs (KEYID= attribute)."""
+async def _fetch_m3u8_text(m3u8_url: str, referer: Optional[str] = None) -> str:
+    """Download m3u8; if it's a master playlist, follow the highest-bandwidth variant."""
     headers: dict[str, str] = {}
     if referer:
         headers["Referer"] = referer
         headers["Origin"] = "https://kinescope.io"
 
-    try:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            m3u8_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            base = str(resp.url).rsplit("/", 1)[0] + "/"
+
+    # Pick the best variant if this is a master playlist
+    best_url: Optional[str] = None
+    best_bw = -1
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            m = re.search(r"BANDWIDTH=(\d+)", line)
+            bw = int(m.group(1)) if m else 0
+            if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                uri = lines[i + 1].strip()
+                if bw > best_bw:
+                    best_bw = bw
+                    best_url = uri if uri.startswith("http") else base + uri
+
+    if best_url:
+        headers2: dict[str, str] = {}
+        if referer:
+            headers2["Referer"] = referer
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                m3u8_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                best_url, headers=headers2, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 resp.raise_for_status()
                 text = await resp.text()
+
+    return text
+
+
+async def extract_drm_info_from_m3u8(
+    m3u8_url: str, referer: Optional[str] = None
+) -> tuple[list[str], Optional[str]]:
+    """Download the HLS manifest and extract:
+    - key IDs (hex) from KEYID= attribute
+    - full license URL, including any `token=` already embedded in the URI
+
+    The license URL in the manifest often already contains the token — no
+    manual user input needed in that case.
+
+    Returns (key_ids, license_url_with_token_or_none).
+    """
+    try:
+        text = await _fetch_m3u8_text(m3u8_url, referer)
     except Exception as e:
-        logger.warning(f"Could not fetch m3u8 for key ID extraction: {e}")
-        return []
+        logger.warning(f"Could not fetch m3u8: {e}")
+        return [], None
 
     key_ids: list[str] = []
+    license_url: Optional[str] = None
+
     for line in text.splitlines():
         if not ("#EXT-X-KEY" in line or "#EXT-X-SESSION-KEY" in line):
             continue
-        # KEYID=0x<32 hex chars>
+
         m = re.search(r"KEYID=0x([0-9a-fA-F]{32})", line)
         if m:
             kid = m.group(1).lower()
             if kid not in key_ids:
                 key_ids.append(kid)
 
-    logger.info(f"Extracted {len(key_ids)} key ID(s) from manifest")
-    return key_ids
+        uri_m = re.search(r'URI="([^"]+)"', line)
+        if uri_m:
+            uri = uri_m.group(1)
+            if "kinescope.io" in uri and "clearkey" in uri:
+                license_url = uri  # keep last match
+
+    logger.info(
+        f"Manifest DRM: {len(key_ids)} key IDs, "
+        f"license_url={'found' if license_url else 'not found'}"
+    )
+    return key_ids, license_url
 
 
 async def fetch_clearkey_keys(
@@ -312,31 +366,51 @@ async def async_download_video(
     )
 
 
+class NeedTokenError(Exception):
+    """Raised when the m3u8 manifest has no embedded token and one must be provided."""
+    pass
+
+
 async def async_download_with_clearkey(
     hls_url: str,
     output_dir: str,
     clearkey_url: str,
-    token: str,
+    token: str = "",
     referer: Optional[str] = None,
     title: Optional[str] = None,
     progress_callback: Optional[Callable] = None,
 ) -> Optional[str]:
     """Full ClearKey download pipeline:
-    1. Extract key IDs from m3u8.
-    2. Fetch keys from license server.
-    3. Patch m3u8 with inline keys.
-    4. Download using patched m3u8.
+    1. Extract key IDs and (hopefully) a token-bearing license URL from the m3u8.
+    2. Fall back to clearkey_url + user-supplied token if the manifest has none.
+    3. Fetch keys from license server.
+    4. Patch m3u8 with inline keys.
+    5. Download using patched m3u8.
+
+    Raises NeedTokenError if no token could be found automatically and none was supplied.
     """
-    # Step 1 – get key IDs
-    key_ids = await get_key_ids_from_m3u8(hls_url, referer)
+    # Step 1 – parse manifest; it may already contain the token in the URI
+    key_ids, manifest_license_url = await extract_drm_info_from_m3u8(hls_url, referer)
+
     if not key_ids:
         raise ValueError(
             "Не удалось извлечь key ID из манифеста. "
             "Возможно, видео использует другой тип шифрования."
         )
 
+    # Prefer the license URL from the manifest (token already embedded) over the
+    # fallback URL from the JSON (which has an empty token= placeholder).
+    effective_license_url = manifest_license_url or clearkey_url
+
+    # If neither source provided a token, ask the user
+    has_token_in_url = "token=" in effective_license_url and not effective_license_url.endswith("token=")
+    if not has_token_in_url and not token:
+        raise NeedTokenError(
+            "Токен не найден в манифесте. Пожалуйста, предоставьте токен вручную."
+        )
+
     # Step 2 – fetch keys
-    clearkey_map = await fetch_clearkey_keys(clearkey_url, key_ids, token, referer)
+    clearkey_map = await fetch_clearkey_keys(effective_license_url, key_ids, token, referer)
     if not clearkey_map:
         raise ValueError(
             "Лицензионный сервер не вернул ключи. "

@@ -21,6 +21,7 @@ from downloader import (
     extract_video_id,
     async_download_video,
     async_download_with_clearkey,
+    NeedTokenError,
     build_kinescope_url,
     parse_kinescope_json,
     get_file_size_mb,
@@ -148,10 +149,8 @@ async def _handle_clearkey_token(
     user = update.effective_user
     info = _token_pending.pop(user.id)
 
-    await update.message.reply_text("Токен получен, начинаю расшифровку и загрузку...")
-
     await _run_download_drm(
-        message=update.message,
+        query_or_message=update.message,
         context=context,
         info=info,
         token=token,
@@ -205,7 +204,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     hls_short = info["hls_url"][:80] + "…"
     referrer = info.get("referrer") or "—"
     drm_note = (
-        "\n⚠️ Видео защищено DRM (ClearKey). После подтверждения бот запросит токен."
+        "\n⚠️ Видео защищено DRM (ClearKey). Бот попробует расшифровать автоматически."
         if info.get("clearkey_url")
         else ""
     )
@@ -269,16 +268,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         if info.get("clearkey_url"):
-            # Video is DRM-protected — ask for token first
-            _token_pending[user.id] = info
-            await query.edit_message_text(
-                "*Видео защищено DRM (ClearKey)*\n\n"
-                "Как получить токен:\n"
-                "1. Открой видео в браузере\n"
-                "2. DevTools → Network → фильтр `license.kinescope.io`\n"
-                "3. Скопируй значение `token=...` из URL запроса\n\n"
-                "Отправь токен следующим сообщением (или /cancel для отмены):",
-                parse_mode=ParseMode.MARKDOWN,
+            # Try to auto-extract token from manifest; ask user only if it fails
+            await _run_download_drm(
+                query_or_message=query,
+                context=context,
+                info=info,
+                token="",
             )
         else:
             await _run_download(
@@ -331,17 +326,25 @@ async def _run_download(
 
 
 async def _run_download_drm(
-    message,
+    query_or_message,  # CallbackQuery or Message
     context: ContextTypes.DEFAULT_TYPE,
     info: dict,
-    token: str,
+    token: str = "",
 ) -> None:
-    chat_id = message.chat_id
-    user_id = message.from_user.id
-
-    status_msg = await message.reply_text(
-        "Запрашиваю ключи расшифровки…",
-    )
+    # Normalise: get chat_id / user_id / status message regardless of source type
+    from telegram import CallbackQuery
+    if isinstance(query_or_message, CallbackQuery):
+        chat_id = query_or_message.message.chat_id
+        user_id = query_or_message.from_user.id
+        status_msg = await query_or_message.edit_message_text(
+            "Извлекаю ключи расшифровки из манифеста…"
+        )
+    else:
+        chat_id = query_or_message.chat_id
+        user_id = query_or_message.from_user.id
+        status_msg = await query_or_message.reply_text(
+            "Токен получен, извлекаю ключи расшифровки…"
+        )
 
     user_dir = Path(DOWNLOAD_DIR) / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -353,13 +356,25 @@ async def _run_download_drm(
         filepath = await async_download_with_clearkey(
             hls_url=info["hls_url"],
             output_dir=str(user_dir),
-            clearkey_url=info["clearkey_url"],
+            clearkey_url=info.get("clearkey_url", ""),
             token=token,
             referer=info.get("referrer"),
             title=info.get("title"),
             progress_callback=_make_progress_callback(status_msg),
         )
         await _send_video(context, chat_id, status_msg, filepath, caption)
+    except NeedTokenError:
+        # Manifest had no embedded token — save state and ask the user
+        _token_pending[user_id] = info
+        await status_msg.edit_text(
+            "*Автоматически получить токен не удалось.*\n\n"
+            "Как найти токен вручную:\n"
+            "1. Открой видео в браузере\n"
+            "2. DevTools → Network → фильтр `license.kinescope.io`\n"
+            "3. Скопируй значение `token=…` из URL запроса\n\n"
+            "Отправь токен следующим сообщением (или /cancel для отмены):",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     except Exception as e:
         await _handle_download_error(context, chat_id, status_msg, e)
     finally:
