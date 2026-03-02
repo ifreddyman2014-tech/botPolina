@@ -5,7 +5,7 @@ import logging
 import aiohttp
 import yt_dlp
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,13 @@ def download_video(
     output_dir: str,
     progress_hook: Optional[Callable] = None,
     referer: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Optional[str]:
-    output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
+    if title:
+        safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
+        output_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
+    else:
+        output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
     ydl_opts = {
         "outtmpl": output_template,
@@ -87,6 +92,7 @@ async def async_download_video(
     output_dir: str,
     progress_callback: Optional[Callable] = None,
     referer: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Optional[str]:
     last_progress = {}
 
@@ -109,8 +115,61 @@ async def async_download_video(
 
     return await loop.run_in_executor(
         None,
-        lambda: download_video(url, output_dir, progress_hook if progress_callback else None, referer),
+        lambda: download_video(
+            url,
+            output_dir,
+            progress_hook if progress_callback else None,
+            referer,
+            title,
+        ),
     )
+
+
+def parse_kinescope_json(data: dict) -> dict:
+    """Extract download info from a Kinescope player state JSON.
+
+    Returns a dict with keys:
+        hls_url   – signed m3u8 URL (required)
+        title     – video title (optional)
+        video_id  – video UUID (optional)
+        referrer  – page referrer (optional)
+        clearkey_url – ClearKey DRM license URL (optional)
+    """
+    result: dict[str, Any] = {}
+
+    # Try options.playlist first, fall back to rawOptions.playlist
+    playlist = (
+        data.get("options", {}).get("playlist")
+        or data.get("rawOptions", {}).get("playlist")
+        or []
+    )
+
+    if playlist:
+        item = playlist[0]
+        sources = item.get("sources", {})
+        hls_src = (
+            sources.get("hls", {}).get("src")
+            or sources.get("shakahls", {}).get("src")
+        )
+        if hls_src:
+            result["hls_url"] = hls_src
+
+        result["title"] = item.get("title") or item.get("meta", {}).get("title")
+        result["video_id"] = item.get("id")
+
+        clearkey = item.get("drm", {}).get("clearkey", {}).get("licenseUrl")
+        if clearkey:
+            result["clearkey_url"] = clearkey
+
+    # Video ID from state (more reliable UUID)
+    state_video_id = data.get("state", {}).get("videoId")
+    if state_video_id:
+        result["video_id"] = state_video_id
+
+    result["referrer"] = data.get("referrer")
+    result["embed_url"] = data.get("url")
+
+    return result
 
 
 def build_kinescope_url(video_id: str) -> str:
