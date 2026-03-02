@@ -20,6 +20,7 @@ from telegram.error import TelegramError
 from downloader import (
     extract_video_id,
     async_download_video,
+    async_download_with_clearkey,
     build_kinescope_url,
     parse_kinescope_json,
     get_file_size_mb,
@@ -44,9 +45,12 @@ ALLOWED_USER_IDS = (
     else set()
 )
 
-# In-memory store for JSON-parsed video info keyed by user_id
-# Avoids exceeding the 64-byte Telegram callback_data limit
+# ── In-memory per-user state ─────────────────────────────────────────────────
+# _json_pending[user_id] = parsed JSON info dict (waiting for download confirm)
 _json_pending: dict[int, dict] = {}
+
+# _token_pending[user_id] = parsed JSON info dict (waiting for ClearKey token)
+_token_pending: dict[int, dict] = {}
 
 
 def is_allowed(user_id: int) -> bool:
@@ -54,6 +58,8 @@ def is_allowed(user_id: int) -> bool:
         return True
     return user_id in ALLOWED_USER_IDS
 
+
+# ── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -63,15 +69,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         f"Привет, {user.first_name}!\n\n"
-        "Я могу скачивать видео с Kinescope.\n\n"
+        "Я скачиваю видео с Kinescope.\n\n"
         "Отправь мне:\n"
         "• Ссылку `https://kinescope.io/VIDEO_ID`\n"
-        "• Ссылку `https://kinescope.io/embed/VIDEO_ID`\n"
-        "• JSON-файл состояния плеера Kinescope\n"
+        "• JSON-файл состояния плеера\n"
         "• Или просто ID видео\n\n"
-        "Команды:\n"
-        "/start — это сообщение\n"
-        "/help — помощь"
+        "/help — подробная помощь"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -82,20 +85,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     text = (
-        "*Как использовать бота:*\n\n"
-        "1. Отправь ссылку на видео с Kinescope\n"
-        "   или JSON-файл состояния плеера\n"
-        "2. Бот скачает видео и пришлёт его тебе\n\n"
-        "*Поддерживаемые форматы ссылок:*\n"
+        "*Как использовать:*\n\n"
+        "1. Отправь ссылку или JSON-файл плеера\n"
+        "2. Подтверди загрузку\n"
+        "3. Если видео защищено DRM — бот запросит токен\n\n"
+        "*Получить токен (для DRM-видео):*\n"
+        "• Открой видео в браузере\n"
+        "• DevTools → Network → фильтр `license.kinescope.io`\n"
+        "• Скопируй значение параметра `token=` из URL запроса\n\n"
+        "*Поддерживаемые ссылки:*\n"
         "• `https://kinescope.io/VIDEO_ID`\n"
         "• `https://kinescope.io/embed/VIDEO_ID`\n"
-        "• `https://player.kinescope.io/...`\n"
-        "• Просто ID видео (буквы и цифры)\n\n"
-        "*JSON-файл:* экспорт состояния плеера (содержит `url`, `referrer`, `options.playlist`)\n\n"
-        f"*Ограничение:* файлы до {MAX_FILE_SIZE_MB:.0f} МБ"
+        "• Просто ID видео\n\n"
+        f"*Максимальный размер:* {MAX_FILE_SIZE_MB:.0f} МБ"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+
+# ── Text message handler ──────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -105,34 +112,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = update.message.text.strip()
 
-    video_id = extract_video_id(text)
+    # ── ClearKey token reply ──────────────────────────────────────────────
+    if user.id in _token_pending:
+        await _handle_clearkey_token(update, context, text)
+        return
 
+    # ── Kinescope URL / ID ────────────────────────────────────────────────
+    video_id = extract_video_id(text)
     if not video_id:
         if re.match(r"^[a-zA-Z0-9\-]{5,}$", text):
             video_id = text
         else:
             await update.message.reply_text(
-                "Не могу найти ID видео Kinescope в вашем сообщении.\n"
-                "Отправьте ссылку вида: `https://kinescope.io/VIDEO_ID` "
-                "или JSON-файл состояния плеера.",
+                "Не могу найти видео Kinescope.\n"
+                "Отправьте ссылку или JSON-файл состояния плеера.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
     video_url = build_kinescope_url(video_id)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("Скачать", callback_data=f"dl:{video_id}"),
-            InlineKeyboardButton("Отмена", callback_data="cancel"),
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("Скачать", callback_data=f"dl:{video_id}"),
+        InlineKeyboardButton("Отмена", callback_data="cancel"),
+    ]]
     await update.message.reply_text(
-        f"Найдено видео Kinescope:\n`{video_url}`\n\nЗагрузить?",
+        f"Найдено видео:\n`{video_url}`\n\nЗагрузить?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+
+async def _handle_clearkey_token(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, token: str
+) -> None:
+    user = update.effective_user
+    info = _token_pending.pop(user.id)
+
+    await update.message.reply_text("Токен получен, начинаю расшифровку и загрузку...")
+
+    await _run_download_drm(
+        message=update.message,
+        context=context,
+        info=info,
+        token=token,
+    )
+
+
+# ── Document (JSON) handler ───────────────────────────────────────────────────
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -141,20 +167,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     doc = update.message.document
-    filename = doc.file_name or ""
-
-    if not filename.lower().endswith(".json"):
-        await update.message.reply_text(
-            "Пожалуйста, отправьте файл с расширением `.json`.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await update.message.reply_text("Пожалуйста, отправьте файл с расширением `.json`.")
         return
 
     if doc.file_size and doc.file_size > 10 * 1024 * 1024:
         await update.message.reply_text("Файл слишком большой (максимум 10 МБ).")
         return
 
-    status = await update.message.reply_text("Читаю JSON файл...")
+    status = await update.message.reply_text("Читаю JSON…")
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)
@@ -164,7 +185,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status.edit_text(f"Не удалось разобрать JSON: {e}")
         return
     except Exception as e:
-        logger.error(f"Error reading JSON document: {e}")
+        logger.error(f"Error reading JSON doc: {e}")
         await status.edit_text(f"Ошибка при чтении файла: {e}")
         return
 
@@ -173,40 +194,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not info.get("hls_url"):
         await status.edit_text(
             "Не нашёл HLS URL в JSON файле.\n"
-            "Убедитесь, что это файл состояния плеера Kinescope "
-            "(должен содержать `options.playlist[0].sources.hls.src`)."
+            "Убедитесь, что это файл состояния плеера Kinescope."
         )
         return
 
-    # Cache parsed info for this user so the callback can retrieve it
     _json_pending[user.id] = info
 
     title = info.get("title") or info.get("video_id") or "видео"
     video_id_display = info.get("video_id") or "—"
-    hls_url = info["hls_url"]
+    hls_short = info["hls_url"][:80] + "…"
     referrer = info.get("referrer") or "—"
+    drm_note = (
+        "\n⚠️ Видео защищено DRM (ClearKey). После подтверждения бот запросит токен."
+        if info.get("clearkey_url")
+        else ""
+    )
 
     preview = (
         f"*Найдено в JSON:*\n"
         f"Название: `{title}`\n"
         f"ID: `{video_id_display}`\n"
         f"Referrer: `{referrer}`\n"
-        f"HLS: `{hls_url[:80]}…`\n\n"
-        f"Загрузить?"
+        f"HLS: `{hls_short}`"
+        f"{drm_note}\n\nЗагрузить?"
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton("Скачать", callback_data="dl_json"),
-            InlineKeyboardButton("Отмена", callback_data="cancel"),
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("Скачать", callback_data="dl_json"),
+        InlineKeyboardButton("Отмена", callback_data="cancel"),
+    ]]
     await status.edit_text(
         preview,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+
+# ── Callback handler ──────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -219,6 +243,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "cancel":
+        _json_pending.pop(user.id, None)
+        _token_pending.pop(user.id, None)
         await query.edit_message_text("Отменено.")
         return
 
@@ -238,119 +264,193 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         info = _json_pending.pop(user.id, None)
         if not info:
             await query.edit_message_text(
-                "Данные устарели. Пожалуйста, отправьте JSON-файл ещё раз."
+                "Данные устарели. Пожалуйста, отправьте JSON ещё раз."
             )
             return
-        await _run_download(
-            query=query,
-            context=context,
-            url=info["hls_url"],
-            title=info.get("title"),
-            referrer=info.get("referrer"),
-            caption=f"Kinescope: `{info.get('video_id') or info.get('title') or 'видео'}`",
-        )
 
+        if info.get("clearkey_url"):
+            # Video is DRM-protected — ask for token first
+            _token_pending[user.id] = info
+            await query.edit_message_text(
+                "*Видео защищено DRM (ClearKey)*\n\n"
+                "Как получить токен:\n"
+                "1. Открой видео в браузере\n"
+                "2. DevTools → Network → фильтр `license.kinescope.io`\n"
+                "3. Скопируй значение `token=...` из URL запроса\n\n"
+                "Отправь токен следующим сообщением (или /cancel для отмены):",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await _run_download(
+                query=query,
+                context=context,
+                url=info["hls_url"],
+                title=info.get("title"),
+                referrer=info.get("referrer"),
+                caption=f"Kinescope: `{info.get('video_id') or info.get('title') or 'видео'}`",
+            )
+
+
+# ── Download helpers ──────────────────────────────────────────────────────────
 
 async def _run_download(
     query,
     context: ContextTypes.DEFAULT_TYPE,
     url: str,
-    title: str | None,
-    referrer: str | None,
+    title: Optional[str],
+    referrer: Optional[str],
     caption: str,
 ) -> None:
     chat_id = query.message.chat_id
     user_id = query.from_user.id
 
     status_msg = await query.edit_message_text(
-        f"Начинаю загрузку...\n`{url[:80]}`",
+        f"Начинаю загрузку…\n`{url[:80]}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    user_download_dir = Path(DOWNLOAD_DIR) / str(user_id)
-    user_download_dir.mkdir(parents=True, exist_ok=True)
+    user_dir = Path(DOWNLOAD_DIR) / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
 
-    last_update = {"percent": -10}
+    filepath = None
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        filepath = await async_download_video(
+            url=url,
+            output_dir=str(user_dir),
+            progress_callback=_make_progress_callback(status_msg),
+            referer=referrer,
+            title=title,
+        )
+        await _send_video(context, chat_id, status_msg, filepath, caption)
+    except Exception as e:
+        await _handle_download_error(context, chat_id, status_msg, e)
+    finally:
+        if filepath:
+            cleanup_file(filepath)
 
-    async def progress_callback(percent: float, downloaded: int, total: int) -> None:
-        if percent - last_update["percent"] >= 10:
-            last_update["percent"] = percent
-            downloaded_mb = downloaded / (1024 * 1024)
-            total_mb = total / (1024 * 1024)
+
+async def _run_download_drm(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    info: dict,
+    token: str,
+) -> None:
+    chat_id = message.chat_id
+    user_id = message.from_user.id
+
+    status_msg = await message.reply_text(
+        "Запрашиваю ключи расшифровки…",
+    )
+
+    user_dir = Path(DOWNLOAD_DIR) / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    caption = f"Kinescope: `{info.get('video_id') or info.get('title') or 'видео'}`"
+    filepath = None
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        filepath = await async_download_with_clearkey(
+            hls_url=info["hls_url"],
+            output_dir=str(user_dir),
+            clearkey_url=info["clearkey_url"],
+            token=token,
+            referer=info.get("referrer"),
+            title=info.get("title"),
+            progress_callback=_make_progress_callback(status_msg),
+        )
+        await _send_video(context, chat_id, status_msg, filepath, caption)
+    except Exception as e:
+        await _handle_download_error(context, chat_id, status_msg, e)
+    finally:
+        if filepath:
+            cleanup_file(filepath)
+
+
+def _make_progress_callback(status_msg):
+    last = {"pct": -10.0}
+
+    async def cb(percent: float, downloaded: int, total: int) -> None:
+        if percent - last["pct"] >= 10:
+            last["pct"] = percent
+            dl_mb = downloaded / (1024 * 1024)
+            tot_mb = total / (1024 * 1024)
             bar = "█" * int(percent / 10) + "░" * (10 - int(percent / 10))
             try:
                 await status_msg.edit_text(
-                    f"Загружаю видео...\n"
-                    f"`[{bar}]` {percent:.0f}%\n"
-                    f"{downloaded_mb:.1f} / {total_mb:.1f} МБ",
+                    f"Загружаю…\n`[{bar}]` {percent:.0f}%\n{dl_mb:.1f} / {tot_mb:.1f} МБ",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except TelegramError:
                 pass
 
-    filepath = None
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+    return cb
 
-        filepath = await async_download_video(
-            url=url,
-            output_dir=str(user_download_dir),
-            progress_callback=progress_callback,
-            referer=referrer,
-            title=title,
+
+async def _send_video(context, chat_id, status_msg, filepath, caption) -> None:
+    if not filepath or not Path(filepath).exists():
+        await status_msg.edit_text(
+            "Не удалось скачать видео. Возможно, ссылка истекла или видео недоступно."
         )
+        return
 
-        if not filepath or not Path(filepath).exists():
-            await status_msg.edit_text(
-                "Не удалось скачать видео. Возможно, ссылка истекла или видео недоступно."
-            )
-            return
+    size_mb = get_file_size_mb(filepath)
+    if size_mb > MAX_FILE_SIZE_MB:
+        await status_msg.edit_text(
+            f"Видео слишком большое ({size_mb:.0f} МБ). Максимум: {MAX_FILE_SIZE_MB:.0f} МБ."
+        )
+        return
 
-        file_size_mb = get_file_size_mb(filepath)
+    await status_msg.edit_text(f"Скачано ({size_mb:.1f} МБ). Отправляю…")
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            await status_msg.edit_text(
-                f"Видео слишком большое ({file_size_mb:.0f} МБ). "
-                f"Максимум: {MAX_FILE_SIZE_MB:.0f} МБ."
-            )
-            return
+    with open(filepath, "rb") as f:
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=f,
+            caption=caption,
+            parse_mode=ParseMode.MARKDOWN,
+            supports_streaming=True,
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=60,
+        )
+    await status_msg.delete()
 
-        await status_msg.edit_text(f"Скачано ({file_size_mb:.1f} МБ). Отправляю...")
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        with open(filepath, "rb") as video_file:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=video_file,
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
-                supports_streaming=True,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=60,
-            )
+async def _handle_download_error(context, chat_id, status_msg, exc: Exception) -> None:
+    logger.error(f"Download error: {exc}")
+    err = str(exc)
+    if "403" in err:
+        msg = "Доступ запрещён (403). Ссылка могла истечь — получите новый JSON."
+    elif "404" in err:
+        msg = "Видео не найдено (404)."
+    elif "Private" in err or "unavailable" in err:
+        msg = "Видео приватное или недоступно."
+    elif "ключи" in err or "key" in err.lower() or "license" in err.lower():
+        msg = f"Ошибка DRM: {err[:300]}"
+    else:
+        msg = f"Ошибка: {err[:300]}"
+    try:
+        await status_msg.edit_text(msg)
+    except TelegramError:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
 
-        await status_msg.delete()
 
-    except Exception as e:
-        logger.error(f"Download error ({url[:60]}): {e}")
-        err = str(e)
-        if "Private video" in err or "unavailable" in err:
-            msg = "Видео приватное или недоступно."
-        elif "403" in err:
-            msg = "Доступ запрещён (403). Ссылка могла истечь — попробуйте получить новый JSON."
-        elif "404" in err:
-            msg = "Видео не найдено (404)."
-        else:
-            msg = f"Ошибка при загрузке: {err[:200]}"
-        try:
-            await status_msg.edit_text(msg)
-        except TelegramError:
-            await context.bot.send_message(chat_id=chat_id, text=msg)
-    finally:
-        if filepath:
-            cleanup_file(filepath)
+# needed for type hint in helpers defined before imports resolved
+from typing import Optional
 
+
+# ── Cancel command ────────────────────────────────────────────────────────────
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    _json_pending.pop(user.id, None)
+    _token_pending.pop(user.id, None)
+    await update.message.reply_text("Отменено.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -362,6 +462,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

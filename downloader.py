@@ -1,7 +1,9 @@
 import os
 import re
+import base64
 import asyncio
 import logging
+import tempfile
 import aiohttp
 import yt_dlp
 from pathlib import Path
@@ -10,13 +12,12 @@ from typing import Optional, Callable, Any
 logger = logging.getLogger(__name__)
 
 KINESCOPE_PATTERNS = [
-    r"https?://kinescope\.io/([a-zA-Z0-9]+)",
-    r"https?://(?:[\w-]+\.)?kinescope\.io/(?:embed/)?([a-zA-Z0-9]+)",
-    r"player\.kinescope\.io/[^\"']*[?&]video_id=([a-zA-Z0-9]+)",
+    r"https?://kinescope\.io/([a-zA-Z0-9\-]+)",
+    r"https?://(?:[\w-]+\.)?kinescope\.io/(?:embed/)?([a-zA-Z0-9\-]+)",
+    r"player\.kinescope\.io/[^\"']*[?&]video_id=([a-zA-Z0-9\-]+)",
 ]
 
 KINESCOPE_API_BASE = "https://kinescope.io/api/videos"
-KINESCOPE_EMBED_BASE = "https://kinescope.io/embed"
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -27,17 +28,200 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
-async def get_video_info(video_id: str) -> Optional[dict]:
-    url = f"{KINESCOPE_API_BASE}/{video_id}"
+# ---------------------------------------------------------------------------
+# ClearKey DRM helpers
+# ---------------------------------------------------------------------------
+
+async def get_key_ids_from_m3u8(m3u8_url: str, referer: Optional[str] = None) -> list[str]:
+    """Download the HLS manifest and extract ClearKey key IDs (KEYID= attribute)."""
+    headers: dict[str, str] = {}
+    if referer:
+        headers["Referer"] = referer
+        headers["Origin"] = "https://kinescope.io"
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
+            async with session.get(
+                m3u8_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                resp.raise_for_status()
+                text = await resp.text()
     except Exception as e:
-        logger.warning(f"Could not fetch video info from API: {e}")
-    return None
+        logger.warning(f"Could not fetch m3u8 for key ID extraction: {e}")
+        return []
 
+    key_ids: list[str] = []
+    for line in text.splitlines():
+        if not ("#EXT-X-KEY" in line or "#EXT-X-SESSION-KEY" in line):
+            continue
+        # KEYID=0x<32 hex chars>
+        m = re.search(r"KEYID=0x([0-9a-fA-F]{32})", line)
+        if m:
+            kid = m.group(1).lower()
+            if kid not in key_ids:
+                key_ids.append(kid)
+
+    logger.info(f"Extracted {len(key_ids)} key ID(s) from manifest")
+    return key_ids
+
+
+async def fetch_clearkey_keys(
+    license_url: str,
+    key_ids: list[str],
+    token: str = "",
+    referer: Optional[str] = None,
+) -> dict[str, str]:
+    """Request ClearKey decryption keys from the Kinescope license server.
+
+    Args:
+        license_url: URL like https://license.kinescope.io/.../clearkey?token=
+        key_ids: List of key IDs in hex (16 bytes = 32 hex chars).
+        token: Auth token to fill into the `?token=` placeholder.
+        referer: Referer header for the license request.
+
+    Returns:
+        dict mapping kid_hex → key_hex.
+    """
+    if not key_ids:
+        return {}
+
+    # Inject token into the license URL
+    if token:
+        url = re.sub(r"(token=)[^&]*", rf"\g<1>{token}", license_url)
+    else:
+        url = license_url
+
+    # Encode key IDs to base64url (no padding) as required by W3C ClearKey spec
+    kids_b64 = [
+        base64.urlsafe_b64encode(bytes.fromhex(kid)).rstrip(b"=").decode()
+        for kid in key_ids
+    ]
+    body = {"kids": kids_b64, "type": "temporary"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://kinescope.io",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    logger.info(f"Requesting ClearKey license from {url}")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+
+    result: dict[str, str] = {}
+    for entry in data.get("keys", []):
+        # base64url decode (add padding)
+        kid = base64.urlsafe_b64decode(entry["kid"] + "==").hex()
+        key = base64.urlsafe_b64decode(entry["k"] + "==").hex()
+        result[kid] = key
+        logger.info(f"Got key for KID {kid[:8]}…")
+
+    return result
+
+
+async def build_patched_m3u8(
+    m3u8_url: str,
+    clearkey_map: dict[str, str],
+    referer: Optional[str] = None,
+    tmpdir: Optional[str] = None,
+) -> Optional[str]:
+    """Download the master m3u8, follow the best-quality variant, patch key URIs
+    with inline `data:` URIs carrying the actual AES-128 key bytes, and write the
+    patched playlist to a temp file.
+
+    Returns the path to the patched m3u8 file (caller must delete it).
+    """
+    headers: dict[str, str] = {}
+    if referer:
+        headers["Referer"] = referer
+        headers["Origin"] = "https://kinescope.io"
+
+    async with aiohttp.ClientSession() as session:
+        # ── 1. Fetch master playlist ──────────────────────────────────────
+        async with session.get(
+            m3u8_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            resp.raise_for_status()
+            master_text = await resp.text()
+            base_url = str(resp.url).rsplit("/", 1)[0] + "/"
+
+        # ── 2. If it's a master playlist, pick the highest-bandwidth variant ─
+        best_variant_url: Optional[str] = None
+        best_bw = -1
+        for i, line in enumerate(master_text.splitlines()):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", line)
+                bw = int(m.group(1)) if m else 0
+                lines = master_text.splitlines()
+                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                    uri = lines[i + 1].strip()
+                    if bw > best_bw:
+                        best_bw = bw
+                        best_variant_url = (
+                            uri if uri.startswith("http") else base_url + uri
+                        )
+
+        if best_variant_url:
+            async with session.get(
+                best_variant_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                resp.raise_for_status()
+                media_text = await resp.text()
+                media_base = str(resp.url).rsplit("/", 1)[0] + "/"
+        else:
+            # Already a media playlist
+            media_text = master_text
+            media_base = base_url
+
+    # ── 3. Patch #EXT-X-KEY lines ─────────────────────────────────────────
+    patched_lines: list[str] = []
+    for line in media_text.splitlines():
+        if "#EXT-X-KEY" in line or "#EXT-X-SESSION-KEY" in line:
+            kid_m = re.search(r"KEYID=0x([0-9a-fA-F]{32})", line)
+            if kid_m:
+                kid = kid_m.group(1).lower()
+                key_hex = clearkey_map.get(kid)
+                if key_hex:
+                    key_bytes = bytes.fromhex(key_hex)
+                    data_uri = (
+                        "data:text/plain;base64,"
+                        + base64.b64encode(key_bytes).decode()
+                    )
+                    # Replace the URI="..." with the inline data URI
+                    line = re.sub(r'URI="[^"]*"', f'URI="{data_uri}"', line)
+                    # Strip unsupported attributes that confuse ffmpeg/yt-dlp
+                    for attr in ("KEYFORMAT", "KEYFORMATVERSIONS", "KEYID"):
+                        line = re.sub(rf",{attr}=[^,\n]*", "", line)
+                    logger.info(f"Patched key URI for KID {kid[:8]}…")
+        patched_lines.append(line)
+
+    # Resolve relative segment URLs so yt-dlp can find them
+    resolved_lines: list[str] = []
+    for line in patched_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("http"):
+            line = media_base + stripped
+        resolved_lines.append(line)
+
+    patched_text = "\n".join(resolved_lines)
+
+    # ── 4. Write to a temp file ───────────────────────────────────────────
+    fd, path = tempfile.mkstemp(suffix=".m3u8", dir=tmpdir)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(patched_text)
+
+    logger.info(f"Patched m3u8 written to {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Core download
+# ---------------------------------------------------------------------------
 
 def download_video(
     url: str,
@@ -52,7 +236,7 @@ def download_video(
     else:
         output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
-    ydl_opts = {
+    ydl_opts: dict[str, Any] = {
         "outtmpl": output_template,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
@@ -66,7 +250,10 @@ def download_video(
     }
 
     if referer:
-        ydl_opts["http_headers"] = {"Referer": referer}
+        ydl_opts["http_headers"] = {
+            "Referer": referer,
+            "Origin": "https://kinescope.io",
+        }
 
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
@@ -94,9 +281,9 @@ async def async_download_video(
     referer: Optional[str] = None,
     title: Optional[str] = None,
 ) -> Optional[str]:
-    last_progress = {}
+    last_progress: dict[str, float] = {}
 
-    def progress_hook(d):
+    def progress_hook(d: dict) -> None:
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
@@ -105,8 +292,8 @@ async def async_download_video(
                 if abs(percent - last_progress.get("percent", 0)) >= 5:
                     last_progress["percent"] = percent
                     asyncio.get_event_loop().call_soon_threadsafe(
-                        lambda p=percent: asyncio.ensure_future(
-                            progress_callback(p, downloaded, total)
+                        lambda p=percent, dl=downloaded, tot=total: asyncio.ensure_future(
+                            progress_callback(p, dl, tot)
                         )
                     )
 
@@ -125,19 +312,71 @@ async def async_download_video(
     )
 
 
+async def async_download_with_clearkey(
+    hls_url: str,
+    output_dir: str,
+    clearkey_url: str,
+    token: str,
+    referer: Optional[str] = None,
+    title: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+) -> Optional[str]:
+    """Full ClearKey download pipeline:
+    1. Extract key IDs from m3u8.
+    2. Fetch keys from license server.
+    3. Patch m3u8 with inline keys.
+    4. Download using patched m3u8.
+    """
+    # Step 1 – get key IDs
+    key_ids = await get_key_ids_from_m3u8(hls_url, referer)
+    if not key_ids:
+        raise ValueError(
+            "Не удалось извлечь key ID из манифеста. "
+            "Возможно, видео использует другой тип шифрования."
+        )
+
+    # Step 2 – fetch keys
+    clearkey_map = await fetch_clearkey_keys(clearkey_url, key_ids, token, referer)
+    if not clearkey_map:
+        raise ValueError(
+            "Лицензионный сервер не вернул ключи. "
+            "Проверьте правильность токена."
+        )
+
+    # Step 3 – patch m3u8
+    patched_path = await build_patched_m3u8(hls_url, clearkey_map, referer, output_dir)
+    if not patched_path:
+        raise RuntimeError("Не удалось создать patched m3u8.")
+
+    try:
+        # Step 4 – download from patched manifest (local file:// path)
+        return await async_download_video(
+            url=f"file://{patched_path}",
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+            referer=referer,
+            title=title,
+        )
+    finally:
+        cleanup_file(patched_path)
+
+
+# ---------------------------------------------------------------------------
+# JSON player-state parser
+# ---------------------------------------------------------------------------
+
 def parse_kinescope_json(data: dict) -> dict:
     """Extract download info from a Kinescope player state JSON.
 
     Returns a dict with keys:
-        hls_url   – signed m3u8 URL (required)
-        title     – video title (optional)
-        video_id  – video UUID (optional)
-        referrer  – page referrer (optional)
+        hls_url      – signed m3u8 URL (required)
+        title        – video title (optional)
+        video_id     – video UUID (optional)
+        referrer     – page referrer (optional)
         clearkey_url – ClearKey DRM license URL (optional)
     """
     result: dict[str, Any] = {}
 
-    # Try options.playlist first, fall back to rawOptions.playlist
     playlist = (
         data.get("options", {}).get("playlist")
         or data.get("rawOptions", {}).get("playlist")
@@ -161,7 +400,6 @@ def parse_kinescope_json(data: dict) -> dict:
         if clearkey:
             result["clearkey_url"] = clearkey
 
-    # Video ID from state (more reliable UUID)
     state_video_id = data.get("state", {}).get("videoId")
     if state_video_id:
         result["video_id"] = state_video_id
@@ -171,6 +409,10 @@ def parse_kinescope_json(data: dict) -> dict:
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def build_kinescope_url(video_id: str) -> str:
     return f"https://kinescope.io/{video_id}"
