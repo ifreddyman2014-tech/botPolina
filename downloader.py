@@ -388,6 +388,7 @@ async def async_download_video(
     platform: Optional[str] = None,
 ) -> Optional[str]:
     last_progress: dict[str, float] = {}
+    loop = asyncio.get_event_loop()
 
     def progress_hook(d: dict) -> None:
         if d["status"] == "downloading":
@@ -397,13 +398,11 @@ async def async_download_video(
                 percent = downloaded / total * 100
                 if abs(percent - last_progress.get("percent", 0)) >= 5:
                     last_progress["percent"] = percent
-                    asyncio.get_event_loop().call_soon_threadsafe(
+                    loop.call_soon_threadsafe(
                         lambda p=percent, dl=downloaded, tot=total: asyncio.ensure_future(
                             progress_callback(p, dl, tot)
                         )
                     )
-
-    loop = asyncio.get_event_loop()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     return await loop.run_in_executor(
