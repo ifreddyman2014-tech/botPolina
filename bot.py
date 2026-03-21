@@ -510,6 +510,13 @@ async def _handle_download_error(
             "2. Сохраните файл cookies.txt на сервере\n"
             "3. Укажите путь в .env: INSTAGRAM_COOKIES_FILE=/path/to/cookies.txt"
         )
+    elif "ffmpeg is not installed" in err.lower() or "ffmpeg" in err.lower():
+        msg = (
+            "ffmpeg не установлен на сервере — невозможно объединить видео и аудио.\n\n"
+            "Установите ffmpeg:\n"
+            "`apt install ffmpeg -y`\n\n"
+            "После установки перезапустите бота."
+        )
     elif "ключи" in err or "key" in err.lower() or "license" in err.lower():
         msg = f"Ошибка DRM: {err[:300]}"
     else:

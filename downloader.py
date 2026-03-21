@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import base64
 import asyncio
 import logging
@@ -314,6 +315,10 @@ async def build_patched_m3u8(
 
 INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
 
+_FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+if not _FFMPEG_AVAILABLE:
+    logger.warning("ffmpeg not found — falling back to single-file formats (no quality merging)")
+
 
 def download_video(
     url: str,
@@ -329,10 +334,14 @@ def download_video(
     else:
         output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
+    if _FFMPEG_AVAILABLE:
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+    else:
+        fmt = "best[ext=mp4]/best"
+
     ydl_opts: dict[str, Any] = {
         "outtmpl": output_template,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
+        "format": fmt,
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
@@ -341,6 +350,9 @@ def download_video(
         "fragment_retries": 10,
         "concurrent_fragment_downloads": 4,
     }
+
+    if _FFMPEG_AVAILABLE:
+        ydl_opts["merge_output_format"] = "mp4"
 
     if referer:
         headers = {"Referer": referer}
