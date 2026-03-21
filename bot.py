@@ -502,6 +502,14 @@ async def _handle_download_error(
         msg = "Видео недоступно в вашем регионе или было удалено."
     elif "age" in err.lower() or "sign in" in err.lower() or "login" in err.lower():
         msg = "Видео требует авторизации или имеет возрастное ограничение."
+    elif "empty media response" in err.lower() and platform == "instagram":
+        msg = (
+            "Instagram не вернул медиафайл. Видео может быть приватным или требовать авторизации.\n\n"
+            "Для скачивания приватных постов настройте cookies:\n"
+            "1. Экспортируйте cookies из браузера (расширение Get cookies.txt)\n"
+            "2. Сохраните файл cookies.txt на сервере\n"
+            "3. Укажите путь в .env: INSTAGRAM_COOKIES_FILE=/path/to/cookies.txt"
+        )
     elif "ключи" in err or "key" in err.lower() or "license" in err.lower():
         msg = f"Ошибка DRM: {err[:300]}"
     else:

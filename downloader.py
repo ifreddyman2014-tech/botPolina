@@ -312,6 +312,9 @@ async def build_patched_m3u8(
 # Core download
 # ---------------------------------------------------------------------------
 
+INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
+
+
 def download_video(
     url: str,
     output_dir: str,
@@ -344,6 +347,10 @@ def download_video(
         if platform == "kinescope":
             headers["Origin"] = "https://kinescope.io"
         ydl_opts["http_headers"] = headers
+
+    if platform == "instagram" and INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+        logger.info(f"Using Instagram cookies from {INSTAGRAM_COOKIES_FILE}")
 
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
