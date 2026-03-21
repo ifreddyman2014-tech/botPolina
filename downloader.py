@@ -313,13 +313,6 @@ async def build_patched_m3u8(
 # Core download
 # ---------------------------------------------------------------------------
 
-INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
-
-_FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
-if not _FFMPEG_AVAILABLE:
-    logger.warning("ffmpeg не найден — используется однофайловый формат без объединения дорожек")
-
-
 def download_video(
     url: str,
     output_dir: str,
@@ -334,7 +327,9 @@ def download_video(
     else:
         output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
-    if _FFMPEG_AVAILABLE:
+    ffmpeg_available = shutil.which("ffmpeg") is not None
+
+    if ffmpeg_available:
         fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
     else:
         fmt = "best[ext=mp4]/best"
@@ -351,7 +346,7 @@ def download_video(
         "concurrent_fragment_downloads": 4,
     }
 
-    if _FFMPEG_AVAILABLE:
+    if ffmpeg_available:
         ydl_opts["merge_output_format"] = "mp4"
 
     if referer:
@@ -360,9 +355,10 @@ def download_video(
             headers["Origin"] = "https://kinescope.io"
         ydl_opts["http_headers"] = headers
 
-    if platform == "instagram" and INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
-        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
-        logger.info(f"Using Instagram cookies from {INSTAGRAM_COOKIES_FILE}")
+    instagram_cookies = os.getenv("INSTAGRAM_COOKIES_FILE", "")
+    if platform == "instagram" and instagram_cookies and os.path.exists(instagram_cookies):
+        ydl_opts["cookiefile"] = instagram_cookies
+        logger.info(f"Using Instagram cookies from {instagram_cookies}")
 
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]

@@ -6,6 +6,9 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -29,8 +32,6 @@ from downloader import (
     get_file_size_mb,
     cleanup_file,
 )
-
-load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
