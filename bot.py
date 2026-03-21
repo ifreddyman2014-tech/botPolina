@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import time
 import logging
 import asyncio
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -55,6 +57,11 @@ PLATFORM_NAMES = {
     "kinescope": "Kinescope",
 }
 
+# Cooldown between requests per user (seconds)
+RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "30"))
+# Max simultaneous active downloads per user
+MAX_CONCURRENT_PER_USER = int(os.getenv("MAX_CONCURRENT_PER_USER", "1"))
+
 # ── In-memory per-user state ─────────────────────────────────────────────────
 # _json_pending[user_id] = parsed JSON info dict (waiting for download confirm)
 _json_pending: dict[int, dict] = {}
@@ -65,11 +72,28 @@ _token_pending: dict[int, dict] = {}
 # _url_pending[user_id] = {"url": str, "platform": str} (waiting for confirm)
 _url_pending: dict[int, dict] = {}
 
+# _last_request[user_id] = timestamp of last download start
+_last_request: dict[int, float] = {}
+
+# _active_downloads[user_id] = count of ongoing downloads
+_active_downloads: defaultdict[int, int] = defaultdict(int)
+
 
 def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
+
+
+def check_rate_limit(user_id: int) -> Optional[str]:
+    """Returns error message string if user is rate-limited, else None."""
+    if _active_downloads[user_id] >= MAX_CONCURRENT_PER_USER:
+        return "Подожди, пока завершится текущая загрузка."
+    elapsed = time.time() - _last_request.get(user_id, 0)
+    if elapsed < RATE_LIMIT_SECONDS:
+        remaining = int(RATE_LIMIT_SECONDS - elapsed)
+        return f"Слишком много запросов. Попробуй через {remaining} сек."
+    return None
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -354,6 +378,14 @@ async def _run_download(
     chat_id = query.message.chat_id
     user_id = query.from_user.id
 
+    limit_msg = check_rate_limit(user_id)
+    if limit_msg:
+        await query.edit_message_text(limit_msg)
+        return
+
+    _last_request[user_id] = time.time()
+    _active_downloads[user_id] += 1
+
     status_msg = await query.edit_message_text(
         f"Начинаю загрузку…\n`{url[:80]}`",
         parse_mode=ParseMode.MARKDOWN,
@@ -377,6 +409,7 @@ async def _run_download(
     except Exception as e:
         await _handle_download_error(context, chat_id, status_msg, e, platform)
     finally:
+        _active_downloads[user_id] = max(0, _active_downloads[user_id] - 1)
         if filepath:
             cleanup_file(filepath)
 
@@ -391,12 +424,21 @@ async def _run_download_drm(
     if isinstance(query_or_message, CallbackQuery):
         chat_id = query_or_message.message.chat_id
         user_id = query_or_message.from_user.id
+
+        limit_msg = check_rate_limit(user_id)
+        if limit_msg:
+            await query_or_message.edit_message_text(limit_msg)
+            return
+
+        _last_request[user_id] = time.time()
+        _active_downloads[user_id] += 1
         status_msg = await query_or_message.edit_message_text(
             "Извлекаю ключи расшифровки из манифеста…"
         )
     else:
         chat_id = query_or_message.chat_id
         user_id = query_or_message.from_user.id
+        # token reply: no new rate-limit check, already counted
         status_msg = await query_or_message.reply_text(
             "Токен получен, извлекаю ключи расшифровки…"
         )
@@ -432,6 +474,7 @@ async def _run_download_drm(
     except Exception as e:
         await _handle_download_error(context, chat_id, status_msg, e, "kinescope")
     finally:
+        _active_downloads[user_id] = max(0, _active_downloads[user_id] - 1)
         if filepath:
             cleanup_file(filepath)
 
@@ -503,14 +546,7 @@ async def _handle_download_error(
     elif "age" in err.lower() or "sign in" in err.lower() or "login" in err.lower():
         msg = "Видео требует авторизации или имеет возрастное ограничение."
     elif "empty media response" in err.lower() and platform == "instagram":
-        msg = (
-            "Инстаграм вернул пустой ответ. Скорее всего, публикация приватная или требует входа в аккаунт.\n\n"
-            "Для загрузки приватных публикаций нужно настроить куки:\n"
-            "1. Установите расширение «Get cookies.txt» в браузере\n"
-            "2. Войдите в Инстаграм и экспортируйте куки\n"
-            "3. Сохраните файл на сервере\n"
-            "4. Укажите путь в .env: INSTAGRAM_COOKIES_FILE=/путь/к/cookies.txt"
-        )
+        msg = "Не удалось скачать видео из Инстаграма. Публикация может быть приватной или доступна только авторизованным пользователям."
     elif "ffmpeg is not installed" in err.lower() or "ffmpeg" in err.lower():
         msg = (
             "На сервере не установлен ffmpeg — невозможно объединить видео и аудио.\n\n"
