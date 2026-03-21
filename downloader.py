@@ -317,7 +317,7 @@ INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
 
 _FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 if not _FFMPEG_AVAILABLE:
-    logger.warning("ffmpeg not found — falling back to single-file formats (no quality merging)")
+    logger.warning("ffmpeg не найден — используется однофайловый формат без объединения дорожек")
 
 
 def download_video(
