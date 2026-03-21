@@ -19,6 +19,41 @@ KINESCOPE_PATTERNS = [
 
 KINESCOPE_API_BASE = "https://kinescope.io/api/videos"
 
+YOUTUBE_PATTERNS = [
+    r"(?:https?://)?(?:www\.)?youtube\.com/watch\?(?:[^&]*&)*v=[\w-]+",
+    r"(?:https?://)?(?:www\.)?youtube\.com/shorts/[\w-]+",
+    r"(?:https?://)?youtu\.be/[\w-]+",
+    r"(?:https?://)?(?:www\.)?youtube\.com/live/[\w-]+",
+]
+
+INSTAGRAM_PATTERNS = [
+    r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|tv)/[\w-]+",
+]
+
+VK_PATTERNS = [
+    r"(?:https?://)?(?:www\.)?vk\.com/video[-\d_]+",
+    r"(?:https?://)?(?:www\.)?vk\.com/clip[-\d_]+",
+    r"(?:https?://)?(?:www\.)?vk\.com/\w+\?(?:[^&]*&)*z=video[-\d_]+",
+    r"(?:https?://)?(?:www\.)?vkvideo\.ru/video[-\d_]+",
+    r"(?:https?://)?vk\.com/video\?z=video[-\d_]+",
+]
+
+
+def detect_platform(url: str) -> Optional[str]:
+    """Returns 'youtube', 'instagram', 'vk', 'kinescope', or None."""
+    for pattern in YOUTUBE_PATTERNS:
+        if re.search(pattern, url, re.IGNORECASE):
+            return "youtube"
+    for pattern in INSTAGRAM_PATTERNS:
+        if re.search(pattern, url, re.IGNORECASE):
+            return "instagram"
+    for pattern in VK_PATTERNS:
+        if re.search(pattern, url, re.IGNORECASE):
+            return "vk"
+    if extract_video_id(url):
+        return "kinescope"
+    return None
+
 
 def extract_video_id(url: str) -> Optional[str]:
     for pattern in KINESCOPE_PATTERNS:
@@ -283,6 +318,7 @@ def download_video(
     progress_hook: Optional[Callable] = None,
     referer: Optional[str] = None,
     title: Optional[str] = None,
+    platform: Optional[str] = None,
 ) -> Optional[str]:
     if title:
         safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
@@ -304,10 +340,10 @@ def download_video(
     }
 
     if referer:
-        ydl_opts["http_headers"] = {
-            "Referer": referer,
-            "Origin": "https://kinescope.io",
-        }
+        headers = {"Referer": referer}
+        if platform == "kinescope":
+            headers["Origin"] = "https://kinescope.io"
+        ydl_opts["http_headers"] = headers
 
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
@@ -334,6 +370,7 @@ async def async_download_video(
     progress_callback: Optional[Callable] = None,
     referer: Optional[str] = None,
     title: Optional[str] = None,
+    platform: Optional[str] = None,
 ) -> Optional[str]:
     last_progress: dict[str, float] = {}
 
@@ -362,6 +399,7 @@ async def async_download_video(
             progress_hook if progress_callback else None,
             referer,
             title,
+            platform,
         ),
     )
 

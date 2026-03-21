@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,6 +20,7 @@ from telegram.error import TelegramError
 
 from downloader import (
     extract_video_id,
+    detect_platform,
     async_download_video,
     async_download_with_clearkey,
     NeedTokenError,
@@ -37,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/kinescope_downloads")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/video_downloads")
 MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "2000"))
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = (
@@ -46,12 +48,22 @@ ALLOWED_USER_IDS = (
     else set()
 )
 
+PLATFORM_NAMES = {
+    "youtube": "YouTube",
+    "instagram": "Instagram",
+    "vk": "VK Видео",
+    "kinescope": "Kinescope",
+}
+
 # ── In-memory per-user state ─────────────────────────────────────────────────
 # _json_pending[user_id] = parsed JSON info dict (waiting for download confirm)
 _json_pending: dict[int, dict] = {}
 
 # _token_pending[user_id] = parsed JSON info dict (waiting for ClearKey token)
 _token_pending: dict[int, dict] = {}
+
+# _url_pending[user_id] = {"url": str, "platform": str} (waiting for confirm)
+_url_pending: dict[int, dict] = {}
 
 
 def is_allowed(user_id: int) -> bool:
@@ -70,11 +82,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         f"Привет, {user.first_name}!\n\n"
-        "Я скачиваю видео с Kinescope.\n\n"
-        "Отправь мне:\n"
-        "• Ссылку `https://kinescope.io/VIDEO_ID`\n"
-        "• JSON-файл состояния плеера\n"
-        "• Или просто ID видео\n\n"
+        "Я скачиваю видео с популярных платформ.\n\n"
+        "*Поддерживаемые сайты:*\n"
+        "• YouTube (видео, Shorts, прямые эфиры)\n"
+        "• Instagram (посты, Reels, IGTV)\n"
+        "• VK Видео (vk.com/video, vkvideo.ru)\n"
+        "• Kinescope (ссылки и JSON-файлы плеера)\n\n"
+        "Просто отправь ссылку на видео!\n\n"
         "/help — подробная помощь"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -87,18 +101,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = (
         "*Как использовать:*\n\n"
-        "1. Отправь ссылку или JSON-файл плеера\n"
+        "1. Отправь ссылку на видео\n"
         "2. Подтверди загрузку\n"
-        "3. Если видео защищено DRM — бот запросит токен\n\n"
-        "*Получить токен (для DRM-видео):*\n"
-        "• Открой видео в браузере\n"
-        "• DevTools → Network → фильтр `license.kinescope.io`\n"
-        "• Скопируй значение параметра `token=` из URL запроса\n\n"
-        "*Поддерживаемые ссылки:*\n"
-        "• `https://kinescope.io/VIDEO_ID`\n"
-        "• `https://kinescope.io/embed/VIDEO_ID`\n"
-        "• Просто ID видео\n\n"
-        f"*Максимальный размер:* {MAX_FILE_SIZE_MB:.0f} МБ"
+        "3. Получи видеофайл\n\n"
+        "*Поддерживаемые платформы:*\n"
+        "• *YouTube* — публичные видео, Shorts\n"
+        "  `https://youtube.com/watch?v=...`\n"
+        "  `https://youtu.be/...`\n\n"
+        "• *Instagram* — публичные посты и Reels\n"
+        "  `https://instagram.com/p/...`\n"
+        "  `https://instagram.com/reel/...`\n\n"
+        "• *VK Видео* — публичные видео\n"
+        "  `https://vk.com/video...`\n"
+        "  `https://vkvideo.ru/video...`\n\n"
+        "• *Kinescope* — ссылка, JSON-файл или ID видео\n\n"
+        f"*Максимальный размер файла:* {MAX_FILE_SIZE_MB:.0f} МБ\n\n"
+        "⚠️ Приватные видео и видео с возрастными ограничениями могут не скачиваться."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -118,6 +136,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_clearkey_token(update, context, text)
         return
 
+    # ── Detect platform from URL ──────────────────────────────────────────
+    platform = detect_platform(text)
+
+    if platform in ("youtube", "instagram", "vk"):
+        platform_name = PLATFORM_NAMES[platform]
+        _url_pending[user.id] = {"url": text, "platform": platform}
+        keyboard = [[
+            InlineKeyboardButton("Скачать", callback_data="dl_url"),
+            InlineKeyboardButton("Отмена", callback_data="cancel"),
+        ]]
+        await update.message.reply_text(
+            f"*{platform_name}:*\n`{text}`\n\nЗагрузить?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
     # ── Kinescope URL / ID ────────────────────────────────────────────────
     video_id = extract_video_id(text)
     if not video_id:
@@ -125,8 +160,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             video_id = text
         else:
             await update.message.reply_text(
-                "Не могу найти видео Kinescope.\n"
-                "Отправьте ссылку или JSON-файл состояния плеера.",
+                "Не могу найти видео.\n"
+                "Отправьте ссылку с YouTube, Instagram, VK или Kinescope.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -137,7 +172,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         InlineKeyboardButton("Отмена", callback_data="cancel"),
     ]]
     await update.message.reply_text(
-        f"Найдено видео:\n`{video_url}`\n\nЗагрузить?",
+        f"Найдено видео Kinescope:\n`{video_url}`\n\nЗагрузить?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -244,7 +279,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "cancel":
         _json_pending.pop(user.id, None)
         _token_pending.pop(user.id, None)
+        _url_pending.pop(user.id, None)
         await query.edit_message_text("Отменено.")
+        return
+
+    if query.data == "dl_url":
+        pending = _url_pending.pop(user.id, None)
+        if not pending:
+            await query.edit_message_text("Данные устарели. Отправьте ссылку ещё раз.")
+            return
+        platform_name = PLATFORM_NAMES.get(pending["platform"], pending["platform"])
+        await _run_download(
+            query=query,
+            context=context,
+            url=pending["url"],
+            title=None,
+            referrer=None,
+            caption=f"{platform_name}: скачано ботом",
+            platform=pending["platform"],
+        )
         return
 
     if query.data.startswith("dl:"):
@@ -256,6 +309,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             title=None,
             referrer=None,
             caption=f"Kinescope: `{video_id}`",
+            platform="kinescope",
         )
         return
 
@@ -268,7 +322,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         if info.get("clearkey_url"):
-            # Try to auto-extract token from manifest; ask user only if it fails
             await _run_download_drm(
                 query_or_message=query,
                 context=context,
@@ -283,6 +336,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 title=info.get("title"),
                 referrer=info.get("referrer"),
                 caption=f"Kinescope: `{info.get('video_id') or info.get('title') or 'видео'}`",
+                platform="kinescope",
             )
 
 
@@ -295,6 +349,7 @@ async def _run_download(
     title: Optional[str],
     referrer: Optional[str],
     caption: str,
+    platform: Optional[str] = None,
 ) -> None:
     chat_id = query.message.chat_id
     user_id = query.from_user.id
@@ -316,10 +371,11 @@ async def _run_download(
             progress_callback=_make_progress_callback(status_msg),
             referer=referrer,
             title=title,
+            platform=platform,
         )
         await _send_video(context, chat_id, status_msg, filepath, caption)
     except Exception as e:
-        await _handle_download_error(context, chat_id, status_msg, e)
+        await _handle_download_error(context, chat_id, status_msg, e, platform)
     finally:
         if filepath:
             cleanup_file(filepath)
@@ -331,7 +387,6 @@ async def _run_download_drm(
     info: dict,
     token: str = "",
 ) -> None:
-    # Normalise: get chat_id / user_id / status message regardless of source type
     from telegram import CallbackQuery
     if isinstance(query_or_message, CallbackQuery):
         chat_id = query_or_message.message.chat_id
@@ -364,7 +419,6 @@ async def _run_download_drm(
         )
         await _send_video(context, chat_id, status_msg, filepath, caption)
     except NeedTokenError:
-        # Manifest had no embedded token — save state and ask the user
         _token_pending[user_id] = info
         await status_msg.edit_text(
             "*Автоматически получить токен не удалось.*\n\n"
@@ -376,7 +430,7 @@ async def _run_download_drm(
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
-        await _handle_download_error(context, chat_id, status_msg, e)
+        await _handle_download_error(context, chat_id, status_msg, e, "kinescope")
     finally:
         if filepath:
             cleanup_file(filepath)
@@ -433,15 +487,21 @@ async def _send_video(context, chat_id, status_msg, filepath, caption) -> None:
     await status_msg.delete()
 
 
-async def _handle_download_error(context, chat_id, status_msg, exc: Exception) -> None:
+async def _handle_download_error(
+    context, chat_id, status_msg, exc: Exception, platform: Optional[str] = None
+) -> None:
     logger.error(f"Download error: {exc}")
     err = str(exc)
     if "403" in err:
-        msg = "Доступ запрещён (403). Ссылка могла истечь — получите новый JSON."
+        msg = "Доступ запрещён (403). Ссылка могла истечь или видео недоступно."
     elif "404" in err:
         msg = "Видео не найдено (404)."
-    elif "Private" in err or "unavailable" in err:
-        msg = "Видео приватное или недоступно."
+    elif "Private" in err or "private" in err.lower():
+        msg = "Видео приватное — скачать невозможно."
+    elif "unavailable" in err.lower():
+        msg = "Видео недоступно в вашем регионе или было удалено."
+    elif "age" in err.lower() or "sign in" in err.lower() or "login" in err.lower():
+        msg = "Видео требует авторизации или имеет возрастное ограничение."
     elif "ключи" in err or "key" in err.lower() or "license" in err.lower():
         msg = f"Ошибка DRM: {err[:300]}"
     else:
@@ -452,16 +512,13 @@ async def _handle_download_error(context, chat_id, status_msg, exc: Exception) -
         await context.bot.send_message(chat_id=chat_id, text=msg)
 
 
-# needed for type hint in helpers defined before imports resolved
-from typing import Optional
-
-
 # ── Cancel command ────────────────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     _json_pending.pop(user.id, None)
     _token_pending.pop(user.id, None)
+    _url_pending.pop(user.id, None)
     await update.message.reply_text("Отменено.")
 
 
